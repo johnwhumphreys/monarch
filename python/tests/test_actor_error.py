@@ -497,7 +497,7 @@ async def test_proc_mesh_monitoring(mesh):
 
     # should not be able to spawn actors anymore as proc mesh is unhealthy
     with pytest.raises(SupervisionError, match="proc mesh is stopped with reason"):
-        await proc.spawn("ex", ExceptionActorSync)
+        await proc.spawn("ex", ExceptionActorSync).initialized
 
 
 @pytest.mark.parametrize(
@@ -533,7 +533,7 @@ async def test_actor_mesh_supervision_handling(mesh):
 
     # should not be able to spawn actors anymore as proc mesh is unhealthy
     with pytest.raises(SupervisionError, match="proc mesh is stopped with reason"):
-        await proc.spawn("ex", ExceptionActorSync)
+        await proc.spawn("ex", ExceptionActorSync).initialized
 
 
 class HealthyActor(Actor):
@@ -657,7 +657,7 @@ async def test_supervision_with_proc_mesh_stopped(mesh):
 
     # proc mesh cannot spawn new actors anymore
     with pytest.raises(RuntimeError, match="`ProcMesh` has already been stopped"):
-        await proc.spawn("immediate", Intermediate)
+        await proc.spawn("immediate", Intermediate).initialized
 
 
 # TODO - re-enable after resolving T232206970

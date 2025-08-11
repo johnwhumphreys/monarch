@@ -349,7 +349,7 @@ class TestRemoteAllocator(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(
                 RuntimeError, msg="`ProcMesh` has already been stopped"
             ):
-                proc_mesh.spawn("test_actor", TestActor).get()
+                proc_mesh.spawn("test_actor", TestActor).initialized.get()
             del actor
 
     async def test_wrong_address(self) -> None:
@@ -415,7 +415,7 @@ class TestRemoteAllocator(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(
                 RuntimeError, msg="`ProcMesh` has already been stopped"
             ):
-                await proc_mesh.spawn("test_actor", TestActor)
+                await proc_mesh.spawn("test_actor", TestActor).initialized
 
             # TODO(agallagher): It'd be nice to test that this just fails
             # immediately, trying to access the wrapped actor mesh, but right
@@ -442,7 +442,7 @@ class TestRemoteAllocator(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(
                 RuntimeError, msg="`ProcMesh` has already been stopped"
             ):
-                await proc_mesh.spawn("test_actor", TestActor)
+                await proc_mesh.spawn("test_actor", TestActor).initialized
 
             # TODO(agallagher): It'd be nice to test that this just fails
             # immediately, trying to access the wrapped actor mesh, but right
@@ -503,7 +503,7 @@ class TestRemoteAllocator(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(
                     RuntimeError, msg="`ProcMesh` has already been stopped"
                 ):
-                    await proc_mesh.spawn("test_actor", TestActor)
+                    await proc_mesh.spawn("test_actor", TestActor).initialized
                 # Exiting a second time should not raise an error.
 
             # TODO(agallagher): It'd be nice to test that this just fails
