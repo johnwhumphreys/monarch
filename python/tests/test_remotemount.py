@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 from isolate_in_subprocess import isolate_in_subprocess
@@ -168,7 +169,7 @@ class TestBlockBoundary:
 
     def test_file_spanning_two_blocks(self) -> None:
         """A file larger than one block occupies two blocks; each holds the
-        correct slice (the tail block zero-padded to BLOCK_SIZE)."""
+        correct slice without padding the tail block."""
         size = BLOCK_SIZE + 1024
         with tempfile.TemporaryDirectory() as d:
             data = os.urandom(size)
@@ -180,10 +181,56 @@ class TestBlockBoundary:
             assert (size + BLOCK_SIZE - 1) // BLOCK_SIZE == 2
             block0, _ = materialise_block(meta, 0, bytearray(BLOCK_SIZE))
             block1, _ = materialise_block(meta, 1, bytearray(BLOCK_SIZE))
-            assert len(block0) == BLOCK_SIZE and len(block1) == BLOCK_SIZE
+            assert len(block0) == BLOCK_SIZE and len(block1) == 1024
             assert block0 == data[:BLOCK_SIZE]
-            assert block1[:1024] == data[BLOCK_SIZE:]
-            assert block1[1024:] == bytes(BLOCK_SIZE - 1024)  # zero-padded tail
+            assert block1 == data[BLOCK_SIZE:]
+
+    def test_old_generation_tail_stays_short_after_appends(
+        self, tmp_path: Path
+    ) -> None:
+        """Each generation's tail is short, even after it is no longer last."""
+        (tmp_path / "old.py").write_bytes(b"old")
+        first = build_index(str(tmp_path), {})
+        (tmp_path / "new.py").write_bytes(b"newer")
+        second = build_index(str(tmp_path), first)
+        (tmp_path / "last.py").write_bytes(b"last")
+        third = build_index(str(tmp_path), second)
+        buf = bytearray(b"x") * BLOCK_SIZE
+        for block, expected in enumerate((b"old", b"newer", b"last")):
+            data, stale = materialise_block(third, block, buf)
+            assert data == expected
+            assert stale == []
+
+    def test_internal_gaps_preserve_offsets_and_retired_blocks_are_empty(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / "a").write_bytes(b"aaa")
+        (tmp_path / "b").write_bytes(b"bbbb")
+        (tmp_path / "c").write_bytes(b"ccccc")
+        before = build_index(str(tmp_path), {})
+        (tmp_path / "b").unlink()
+        (tmp_path / "later").write_bytes(b"later")
+        after = build_index(str(tmp_path), before)
+        buf = bytearray(b"x") * BLOCK_SIZE
+        data, stale = materialise_block(after, 0, buf)
+        assert data == b"aaa" + b"xxxx" + b"ccccc"
+        assert after["/c"]["global_offset"] == before["/c"]["global_offset"] == 7
+        assert stale == []
+        (tmp_path / "a").unlink()
+        (tmp_path / "c").unlink()
+        final = build_index(str(tmp_path), after)
+        assert materialise_block(final, 0, buf) == (b"", [])
+        assert materialise_block(final, 1, buf) == (b"later", [])
+
+    def test_short_payload_preserves_stale_file_ranges(self, tmp_path: Path) -> None:
+        (tmp_path / "a").write_bytes(b"good")
+        (tmp_path / "b").write_bytes(b"stale")
+        index = build_index(str(tmp_path), {})
+        (tmp_path / "b").unlink()
+        data, stale = materialise_block(index, 0, bytearray(BLOCK_SIZE))
+        assert len(data) == 9  # Keep the original fenced extent, even if missing.
+        assert data[:4] == b"good"
+        assert stale == ["/b"]
 
     def test_file_exactly_one_block(self) -> None:
         """A file exactly one block long occupies a single block; the next block
@@ -554,11 +601,11 @@ def _pack_for_test(
     staging = bytearray(total_size)
     mat_buf = bytearray(BLOCK_SIZE)
     for b in range(n_blocks):
-        # materialise_block returns a fixed BLOCK_SIZE buffer; clip the tail
-        # block's zero pad so ``staging`` stays exactly total_size.
+        # A payload can be shorter than its layout extent (including an old
+        # generation's tail). Leave the remaining staging bytes zeroed.
         block_bytes, _ = materialise_block(meta, b, mat_buf)
         start = b * BLOCK_SIZE
-        valid = min(BLOCK_SIZE, total_size - start)
+        valid = len(block_bytes)
         staging[start : start + valid] = block_bytes[:valid]
     staging_mv = memoryview(staging)
     return meta, staging_mv, [staging_mv]

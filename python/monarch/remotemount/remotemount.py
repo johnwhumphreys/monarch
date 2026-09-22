@@ -237,13 +237,14 @@ def materialise_block(
 ) -> tuple[bytes, list[str]]:
     """Re-read block ``block`` from the source into ``buf``, a caller-owned
     ``BLOCK_SIZE`` ``bytearray`` reused across calls (the client keeps one per mount
-    instead of allocating + zeroing a fresh 64 MiB ``bytearray`` per delivery). Every
-    block is the same length and only the ranges files occupy are (re)written, so
-    ``buf`` may still carry the previous block's bytes in the inter-file gaps and the
-    tail past ``total_size`` -- harmless, because those positions map to no file and a
-    FUSE read is clamped to its file's size, so no read ever serves them. The fixed
-    size lets a downstream transport move uniform chunks (e.g. a fixed-size receive
-    buffer).
+    instead of allocating + zeroing a fresh 64 MiB ``bytearray`` per delivery).
+    Return only the prefix through the last byte referenced by a file in this
+    block. This also trims older generation tails after refresh has appended new
+    blocks; the layout's ``total_size`` alone cannot identify those tails.
+    Offsets and internal gaps stay intact. Only file ranges are overwritten, so
+    gaps may carry previous buffer contents, but no file read can address them.
+    Receivers retain fixed-size staging buffers and wait for the payload's actual
+    length. An unreferenced block within the layout has an empty payload.
 
     Returns ``(bytes, diverged)``: the block buffer (``bytes``, not the working
     ``bytearray`` -- the actor message bus rejects ``bytearray`` with "cannot be
@@ -264,6 +265,7 @@ def materialise_block(
         )
     block_end = block_start + BLOCK_SIZE
     mv = memoryview(buf)
+    used_end = 0
     diverged: list[str] = []
     for vpath, node in index.items():
         off = node.get("global_offset")
@@ -273,6 +275,7 @@ def materialise_block(
         hi = min(off + node["file_len"], block_end)
         if lo >= hi:
             continue  # this file does not touch the block
+        used_end = max(used_end, hi - block_start)
         dst = mv[lo - block_start : hi - block_start]
         full_path = node["full_path"]
         # Reproduce the file's fenced bytes, guarded by the size+mtime fence (anything
@@ -294,7 +297,7 @@ def materialise_block(
             # stale file EIOs -- it just hardens against an EIO-check bypass.
             diverged.append(vpath)
             dst[:] = os.urandom(hi - lo)
-    return bytes(buf), diverged
+    return bytes(mv[:used_end]), diverged
 
 
 def _point_to_key(point: dict) -> str:
