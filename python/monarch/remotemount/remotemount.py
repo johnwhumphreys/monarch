@@ -205,8 +205,8 @@ def build_index(source_path: str, previous: dict) -> dict:
     # --- Assign new/changed files block-aligned offsets past the previous
     # high-water mark, small (code) files first for prefill locality -- the whole
     # of "append-only": kept files never move, so a worker's already-delivered
-    # blocks stay valid across a refresh (cost: up to one block of dead space per
-    # append generation, reclaimed by a fresh ``previous={}`` defrag). ---
+    # blocks stay valid across a refresh. Workers reclaim unreferenced block
+    # bytes; the offset gaps are compacted by a fresh ``previous={}`` defrag. ---
     offset = previous.get("/", {}).get("total_size", 0)
     if appended and offset % BLOCK_SIZE != 0:
         offset = (offset // BLOCK_SIZE + 1) * BLOCK_SIZE  # block-align
@@ -409,8 +409,8 @@ class FUSEActor(Actor):
 
         Atomically swaps ``meta`` + size into the running FUSE filesystem.
         Open file handles remain valid and subsequent reads see the new data.
-        Append-only: blocks already delivered (held in memory) stay valid, so
-        this is just a metadata swap. The total size is read from
+        Append-only: delivered blocks stay valid while referenced; blocks with
+        no remaining file references are reclaimed. The total size is read from
         ``meta["/"]["total_size"]``, which the layout build records there.
         """
         if self._fuse_handle is None:
@@ -674,9 +674,9 @@ class MountHandlerClient(Actor):
         ... -> w[N-1]) via ``send_block``, then barriers on the leader's ``await_block``
         until every worker has received AND committed it (an intra-cluster gather), so a
         returned call means every worker holds the block
-        -- which is what makes the ``_delivered`` set safe: blocks live in worker memory
-        for the life of the mount, and ``open`` clears the set when it (re-)spawns the
-        mesh, so we never re-deliver a block the current workers already hold. Dedup is
+        -- which is what makes the ``_delivered`` set safe: referenced blocks stay
+        in worker memory, and retired ids are never reused. ``open`` clears the set
+        when it (re-)spawns the mesh. Dedup is
         by block, so a cross-worker fault storm for one block collapses to one delivery.
         Delivery is synchronous (one block at a time); overlapping deliveries would be a
         follow-up.
@@ -887,8 +887,9 @@ class MountHandlerClient(Actor):
         -- even through a handle opened before the refresh -- see the new data.
 
         Block-aligned appends mean an existing block id's content never changes,
-        so the worker's already-delivered (in-memory) blocks stay valid and there
-        is nothing to invalidate. The new tail blocks are NOT pushed here -- they
+        so the worker's already-delivered blocks stay valid while any file still
+        references them. Refresh reclaims blocks with no remaining references.
+        The new tail blocks are NOT pushed here -- they
         fault in on demand on the next read, like every other block (open's code
         prefill is the only proactive delivery). So a refresh is just a metadata
         swap; even a big change costs nothing until something reads it.

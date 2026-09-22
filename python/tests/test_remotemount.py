@@ -941,6 +941,47 @@ class TestFuseMount:
 class TestFuseRefresh:
     """Tests for live FUSE refresh (atomic data swap without unmount)."""
 
+    def test_refresh_wakes_read_waiting_for_replaced_file(self) -> None:
+        """An old-generation fault must re-resolve its path after refresh."""
+        faulted = threading.Event()
+        results: list[bytes] = []
+        metadata: dict[str, object] = {
+            "/": {"attr": _dir_attr(), "children": ["code"]},
+            "/code": {
+                "attr": _file_attr(4),
+                "global_offset": 0,
+                "file_len": 4,
+            },
+        }
+        with tempfile.TemporaryDirectory() as mnt:
+            handle = mount_chunked_fuse(metadata, 4, mnt, lambda _: faulted.set())
+
+            def read() -> None:
+                with open(os.path.join(mnt, "code"), "rb") as source:
+                    results.append(source.read())
+
+            reader = threading.Thread(target=read, daemon=True)
+            reader.start()
+            try:
+                assert faulted.wait(5), "read did not fault on the missing old block"
+                ctypes.memmove(handle.block_ptr(1), b"new!", 4)
+                handle.receive_block(1, [])
+                metadata["/code"] = {
+                    "attr": _file_attr(4),
+                    "global_offset": BLOCK_SIZE,
+                    "file_len": 4,
+                }
+                handle.refresh(metadata, BLOCK_SIZE + 4)
+                reader.join(timeout=5)
+                assert not reader.is_alive(), "refresh stranded an old-generation read"
+                assert results == [b"new!"]
+            finally:
+                # Unblock the read even when run against the old implementation.
+                ctypes.memmove(handle.block_ptr(0), b"old!", 4)
+                handle.receive_block(0, [])
+                reader.join(timeout=5)
+                handle.unmount()
+
     def test_unchanged_file(self) -> None:
         """File content identical before/after refresh — reads are correct."""
         content = b"unchanged data here"

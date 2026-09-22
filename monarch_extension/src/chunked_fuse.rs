@@ -31,7 +31,8 @@
 //! rebuilt).
 //!
 //! `PyMountHandle::refresh` atomically swaps the metadata behind the `RwLock` and
-//! grows the (append-only) block table for new tail blocks. All FUSE methods take a
+//! grows the (append-only) block table for new tail blocks, releasing delivered
+//! bytes no longer referenced by any file. All FUSE methods take a
 //! read lock, so reads run concurrently and are only briefly blocked during the
 //! write-lock swap; a read's bytes are gathered (one copy) from the touched blocks
 //! under that read lock.
@@ -105,6 +106,8 @@ impl FsEntry {
 /// one write-lock acquisition.
 struct FsState {
     metadata: HashMap<OsString, FsEntry>,
+    /// Detect refresh between a fault lookup and registering its waiter.
+    generation: u64,
     /// Positional block table indexed by block id (= global_offset / block size);
     /// ``None`` is not-yet-delivered, ``Some(bytes)`` is delivered. Sized to the block
     /// count at mount and grown (append-only) on refresh. Staleness lives per file
@@ -129,6 +132,41 @@ struct FsState {
 }
 
 impl FsState {
+    /// Keep stable block ids, but release bytes no file in the new tree uses.
+    /// A changed file gets a new block-aligned offset on every refresh; retaining
+    /// its old blocks would cost 64 MiB per edit per worker indefinitely.
+    fn refresh(&mut self, metadata: HashMap<OsString, FsEntry>, total_size: usize) {
+        let mut live = vec![false; total_size.div_ceil(AVAILABILITY_BLOCK_SIZE)];
+        for entry in metadata.values() {
+            if let FsEntry::File {
+                global_offset,
+                file_len,
+                ..
+            } = entry
+                && *file_len > 0
+            {
+                let first = global_offset / AVAILABILITY_BLOCK_SIZE;
+                let last = (global_offset + file_len - 1) / AVAILABILITY_BLOCK_SIZE;
+                live[first..=last].fill(true);
+            }
+        }
+        self.metadata = metadata;
+        self.total_size = total_size;
+        self.generation += 1;
+        self.grow_to(live.len());
+        for (id, block) in self.blocks.iter_mut().enumerate() {
+            if !live.get(id).copied().unwrap_or(false) {
+                *block = None;
+            }
+        }
+        // Do not touch reserved: a transport may still hold a raw pointer into
+        // an in-flight staging buffer. A late obsolete delivery is reclaimed
+        // by the next refresh. Wake parked reads to resolve their path again.
+        for notify in &self.block_notifys {
+            notify.notify_waiters();
+        }
+    }
+
     fn lookup_entry(&self, path: &OsStr) -> Option<&FsEntry> {
         self.metadata.get(path)
     }
@@ -443,7 +481,7 @@ impl PathFilesystem for ChunkedFuseFs {
             // present, under the read lock. If every touched block is present,
             // gather and return without dropping the lock so no refresh can swap
             // state mid-read; otherwise take that block's notify to wait on.
-            let (block, notify) = {
+            let (block, notify, generation) = {
                 let state = self.state.read().unwrap();
                 let entry = state.lookup_entry(path).ok_or_else(Errno::new_not_exist)?;
                 let FsEntry::File {
@@ -480,7 +518,7 @@ impl PathFilesystem for ChunkedFuseFs {
                             data: read_blocks(&state.blocks, global_offset, file_len, offset, size),
                         });
                     }
-                    Some(b) => (b, state.block_notifys[b].clone()),
+                    Some(b) => (b, state.block_notifys[b].clone(), state.generation),
                 }
             };
 
@@ -494,8 +532,13 @@ impl PathFilesystem for ChunkedFuseFs {
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.state.read().unwrap().blocks[block].is_some() {
-                continue;
+            {
+                let state = self.state.read().unwrap();
+                // Refresh may have notified before this waiter was registered.
+                // Re-resolve the path even if the old block is still absent.
+                if state.generation != generation || state.blocks[block].is_some() {
+                    continue;
+                }
             }
             monarch_with_gil_blocking(GilSite::EndpointDispatch, |py| {
                 if let Err(e) = self.fault_callback.bind(py).call1((block,)) {
@@ -745,7 +788,8 @@ impl PyMountHandle {
     ///
     /// Append-only: unchanged block_ids keep their in-memory bytes, and any
     /// appended blocks fault in on demand after the swap -- so refresh only swaps
-    /// the tree + sizing, never the block contents. (A defrag, which reassigns
+    /// the tree + sizing and releases blocks no longer referenced by any file.
+    /// Partially live blocks remain intact. (A defrag, which reassigns
     /// block_ids, re-mounts rather than refreshing.)
     ///
     /// Sleeps 3× the FUSE TTL after the lock is released so kernel
@@ -759,14 +803,7 @@ impl PyMountHandle {
         let new_metadata = extract_metadata(metadata)?;
         {
             let mut state = self.state.write().unwrap();
-            state.metadata = new_metadata;
-            state.total_size = new_total_size;
-            // Append-only: grow the block table (and its notifys) for the new tail
-            // blocks; existing ids keep their delivered bytes. A shrink never happens
-            // here -- a defrag re-mounts instead of refreshing. New blocks fault in
-            // on demand, so no parked reader needs waking here.
-            let num_blocks = new_total_size.div_ceil(AVAILABILITY_BLOCK_SIZE);
-            state.grow_to(num_blocks);
+            state.refresh(new_metadata, new_total_size);
         }
         // Wait for kernel FUSE attr/page caches (TTL=200ms) to expire.
         let settle = Duration::from_millis(DEFAULT_TTL_MS * 3);
@@ -782,7 +819,8 @@ impl PyMountHandle {
     /// address as a writable memoryview (e.g. via ``ctypes``), writes the block into it
     /// (RDMA read / staged copy), then commits it with ``receive_block``. Valid for the
     /// buffer's life: the allocation does not move, and ``receive_block``'s freeze is
-    /// zero-copy (the same address carries into the served ``Bytes``).
+    /// zero-copy (the same address carries into the served ``Bytes``). Callers must
+    /// stop using the pointer at commit: refresh can reclaim unreferenced bytes.
     fn block_ptr(&self, block_id: usize) -> usize {
         let mut state = self.state.write().unwrap();
         state
@@ -848,6 +886,7 @@ fn mount_chunked_fuse(
     let num_blocks = total_size.div_ceil(AVAILABILITY_BLOCK_SIZE);
     let state = Arc::new(RwLock::new(FsState {
         metadata,
+        generation: 0,
         blocks: vec![None; num_blocks],
         block_notifys: (0..num_blocks).map(|_| Arc::new(Notify::new())).collect(),
         total_size,
@@ -970,9 +1009,110 @@ pub fn register_python_bindings(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
+    fn file(offset: usize, len: usize) -> FsEntry {
+        FsEntry::File {
+            attr: FileAttr {
+                size: len as u64,
+                blocks: 0,
+                atime: UNIX_EPOCH,
+                mtime: UNIX_EPOCH,
+                ctime: UNIX_EPOCH,
+                kind: FileType::RegularFile,
+                perm: 0o444,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 4096,
+                #[cfg(target_os = "macos")]
+                crtime: UNIX_EPOCH,
+                #[cfg(target_os = "macos")]
+                flags: 0,
+            },
+            global_offset: offset,
+            file_len: len,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn refresh_reclaims_edit_history_without_moving_unchanged_files() {
+        let mut state = new_state();
+        mark_ready(&mut state, 0, b"unchanged");
+        let original = state.blocks[0].as_ref().unwrap().as_ptr();
+        for generation in 1..=200 {
+            let offset = generation * AVAILABILITY_BLOCK_SIZE;
+            state.refresh(
+                HashMap::from([
+                    (OsString::from("/library"), file(0, 9)),
+                    (OsString::from("/code"), file(offset, 4)),
+                ]),
+                offset + 4,
+            );
+            mark_ready(&mut state, generation, b"code");
+            assert_eq!(state.blocks.iter().flatten().count(), 2);
+            assert_eq!(state.blocks[0].as_ref().unwrap().as_ptr(), original);
+            assert_eq!(read_blocks(&state.blocks, offset, 4, 0, 4), &b"code"[..]);
+        }
+    }
+
+    #[test]
+    fn refresh_retains_shared_and_spanning_blocks_but_not_empty_files() {
+        let mut state = new_state();
+        for block in 0..5 {
+            mark_ready(&mut state, block, b"data");
+        }
+        state.refresh(
+            HashMap::from([
+                (OsString::from("/shared"), file(10, 2)),
+                // Ends exactly at block 3's boundary: only blocks 1 and 2 are live.
+                (
+                    OsString::from("/spanning"),
+                    file(2 * AVAILABILITY_BLOCK_SIZE - 1, AVAILABILITY_BLOCK_SIZE + 1),
+                ),
+                (
+                    OsString::from("/empty"),
+                    file(4 * AVAILABILITY_BLOCK_SIZE, 0),
+                ),
+            ]),
+            5 * AVAILABILITY_BLOCK_SIZE,
+        );
+        assert_eq!(
+            state.blocks.iter().map(Option::is_some).collect::<Vec<_>>(),
+            vec![true, true, true, false, false]
+        );
+        state.refresh(HashMap::new(), state.total_size);
+        assert!(state.blocks.iter().all(Option::is_none));
+    }
+
+    #[tokio::test]
+    async fn refresh_wakes_old_faults_and_preserves_inflight_staging_buffers() {
+        let mut state = new_state();
+        state.grow_to(1);
+        *state.reserved_slot(0) = Some(BytesMut::from(&b"in flight"[..]));
+        let pointer = state.reserved[0].as_ref().unwrap().as_ptr();
+        let notify = state.block_notifys[0].clone();
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let old_generation = state.generation;
+        state.refresh(HashMap::new(), AVAILABILITY_BLOCK_SIZE);
+        tokio::time::timeout(Duration::from_secs(1), notified)
+            .await
+            .unwrap();
+        assert_ne!(state.generation, old_generation);
+        assert_eq!(state.reserved[0].as_ref().unwrap().as_ptr(), pointer);
+        // A late delivery may land after refresh; the next refresh reclaims it.
+        state.commit_block(0, Vec::new());
+        assert!(state.blocks[0].is_some());
+        state.refresh(HashMap::new(), AVAILABILITY_BLOCK_SIZE);
+        assert!(state.blocks[0].is_none());
+    }
+
     fn new_state() -> FsState {
         FsState {
             metadata: HashMap::new(),
+            generation: 0,
             blocks: Vec::new(),
             block_notifys: Vec::new(),
             total_size: 0,
