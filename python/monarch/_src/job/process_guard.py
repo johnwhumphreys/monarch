@@ -82,6 +82,9 @@ class ProcessGuard:
                     pass_fds=(fd,),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
+                    # Allocation services must survive a client's terminal or
+                    # process-group shutdown, not just a normal Python exit.
+                    start_new_session=True,
                 )
                 _write_record(fd, _LockRecord(new_key_bytes, proc.pid, socket_path))
 
@@ -201,7 +204,12 @@ def _wait_for_pid_exit(pid: int, timeout: float = 10.0) -> None:
             return
         if time.monotonic() >= deadline:
             try:
-                os.kill(pid, signal.SIGKILL)
+                # New guarded processes own their session, including gateway
+                # subprocesses. Retain support for older non-session leaders.
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 return
             time.sleep(0.1)
